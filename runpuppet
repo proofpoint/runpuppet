@@ -1,0 +1,925 @@
+#!/usr/bin/env ruby
+
+# inlined longopt.rb
+require 'getoptlong'
+
+class Longopt < Hash
+
+   attr_accessor :optspec
+
+   def Longopt.new_with_args(argv, *optspecs)
+      obj = Longopt.allocate
+      obj.getopts_with_argv(argv, *optspecs)
+      obj
+   end
+
+   def getopts_with_args(argv, *optspeclist)
+      saveargv = ARGV.dup
+      # produces warning
+      ARGV.replace(argv)
+      getopts(*optspeclist)
+      ARGV.replace(saveargv)
+      self
+   end
+
+   def Longopt.default(opth)
+      obj = Longopt.allocate
+      obj.merge(opth)
+   end
+
+   def initialize(*optspecs)
+      getopts(*optspecs)
+   end
+
+   def getopts(*optspecs)
+      @optspec = { }
+
+      if optspecs.size == 1 and optspecs[0].respond_to? :to_ary
+         optspecs = optspecs[0]
+      end
+
+      optspecs.each do |optspec|
+         if m = /^([\w_\-]+)([=:!+].*)/.match(optspec)
+            opt = m[1]
+            @optspec[opt] = { }
+
+            act, typ, collect_typ = m[2].split('')
+
+            case act
+
+            when '='
+               @optspec[opt]['gol-argument-type'] =
+                  GetoptLong::REQUIRED_ARGUMENT
+               @optspec[opt]['type-letter'] = typ
+               @optspec[opt]['collection-type'] = collect_typ
+
+            when ':'
+               @optspec[opt]['gol-argument-type'] =
+                  GetoptLong::OPTIONAL_ARGUMENT
+               @optspec[opt]['type-letter'] = typ
+               @optspec[opt]['collection-type'] = collect_typ
+
+            when '!'
+               @optspec[opt]['gol-argument-type'] = GetoptLong::NO_ARGUMENT
+               @optspec[opt]['type-letter'] = 'b'
+               @optspec['no' + opt] = { }
+               @optspec['no' + opt]['gol-argument-type'] =
+                  GetoptLong::NO_ARGUMENT
+
+            when '+'
+               @optspec[opt]['gol-argument-type'] = GetoptLong::NO_ARGUMENT
+               @optspec[opt]['type-letter'] = 'a'
+
+            end
+         else
+            puts "Warning: default option type for #{optspec}"
+            @optspec[optspec] = { }
+            @optspec[optspec]['gol-argument-type'] = GetoptLong::NO_ARGUMENT
+            @optspec[optspec]['type-letter'] = 'i'
+         end
+      end
+
+      gol_arguments = @optspec.map { |opt, optspec|
+         ['--' + opt,
+          optspec['gol-argument-type']]
+      }
+
+      GetoptLong.new(*gol_arguments).each do |k, v|
+         k = k.sub(/^--/, '')
+
+         case k
+
+         when *booleans
+            self[k] = true
+
+         when *nobooleans
+            self[k[2..-1]] = false
+
+         when *simples
+            self[k] = simple_value(k, v)
+
+         when *lists
+            self[k] = [ ] unless key? k
+            self[k].push(simple_value(k, v))
+
+         when *mappings
+            self[k] = { } unless key? k
+            mkey, mvalue = v.split(/=/)
+            self[k][mkey] = simple_value(k, mvalue)
+
+         end
+      end
+
+   end
+
+   def simple_value(opt, optarg)
+      case @optspec[opt]['type-letter']
+      when 's'
+         optarg
+      when 'i'
+         Integer(optarg)
+      when 'f'
+         Float(optarg)
+      when 'a'
+         if key? opt
+            rv = self[opt] + 1
+         else
+            rv = 1
+         end
+         rv
+      else
+         nil
+      end
+   end
+
+   def booleans
+      @optspec.reject { |k, v| v['type-letter'] != 'b' }.keys
+   end
+
+   def nobooleans
+      @optspec.reject { |k, v| v['type-letter'] != 'b' }.keys.map { |el| 'no' + el }
+   end
+
+   def simples
+      @optspec.reject { |k, v| ! v['collection-type'].nil? ||
+                              v['type-letter'].nil? ||
+                              v['type-letter'] == 'b' }.keys
+   end
+
+   def lists
+      @optspec.reject { |k, v| v['collection-type'] != '@' }.keys
+   end
+
+   def mappings
+      @optspec.reject { |k, v| v['collection-type'] != '%' }.keys
+   end
+
+end
+
+require 'net/http'
+
+class PPInventory
+
+   def dbg(msg)
+      if @opt.has_key? 'debug' and @opt['debug'] > 1
+         puts "DBG(PPInventory): #{msg}"
+      end
+   end
+
+   def initialize(opt)
+      @opt = opt
+      self.dbg "Initialized with options: #{opt.inspect}"
+   end
+
+   def query(type, *condlist)
+       require 'json'
+      url = URI.parse(@opt['inventory']['url'])
+      url.path = url.path + (/\/$/.match(url.path) ? '' : '/') + type
+      url.query = condlist.join('&')
+      self.dbg("GET #{url.to_s}")
+      http = Net::HTTP.new(url.host, url.port)
+      request = Net::HTTP::Get.new(url.request_uri)
+      if @opt['inventory'].has_key? 'username'
+         request.basic_auth(@opt['inventory']['username'],
+                       @opt['inventory']['password'])
+      end
+      response = http.request(request)
+      if response.code[0] != ?2
+         raise "Error connecting to inventory " +
+            "(#{response.code}): #{response.body}"
+      end
+
+      JSON.parse(response.body)
+   end
+
+   def tc_post(obj)
+      # Post the object to trafficcontrol
+      # obj is something you can call .to_json on
+      url = URI.parse(@opt['trafficcontrol']['url'])
+      self.dbg "Posting to #{url.inspect}"
+      res = Net::HTTP.start(url.host, url.port) do |http|
+         self.dbg "Connected to #{url.host}:#{url.port}"
+         req = Net::HTTP::Post.new(url.path)
+         req.body = obj.to_json
+         self.dbg "BODY = #{obj.to_json}"
+         if @opt['trafficcontrol'].has_key? 'username'
+            self.dbg "   using username #{@opt['trafficcontrol']['username']}"
+            self.dbg "   using password #{@opt['trafficcontrol']['password']}"
+            req.basic_auth @opt['trafficcontrol']['username'], @opt['trafficcontrol']['password']
+         end
+         self.dbg "Sending request #{req.inspect}"
+         http.request(req)
+      end
+      self.dbg res.inspect
+      if res.code[0] == ?2
+         self.dbg "   success (#{res.code})"
+         true
+      else
+         raise "Error posting to TC: #{res}"
+      end
+   end
+
+end
+
+class NagiosPlugin
+    EXIT_SUCCESS  = 0
+    EXIT_WARNING  = 1
+    EXIT_CRITICAL = 2
+    EXIT_UNKNOWN  = 3
+
+    STATUS_STR = %w(OK WARNING CRITICAL UNKNOWN)
+
+    attr_accessor :summary, :perfdata, :verbose, :runid, :fqdn,
+        :debug
+
+    def initialize(servicename)
+        @servicename = servicename
+        @runid = nil
+        @status = EXIT_SUCCESS
+        @perfdata = [ ]
+        @messages = [ ]
+        @verbose = false
+        @report = nil
+        @enable = true
+    end
+
+    def status_category
+        if @status_category.nil?
+            STATUS_STR[@status]
+        else
+            @status_category
+        end
+    end
+
+    def status_category=(value)
+        @status_category = value
+    end
+
+    def enable
+        @enable
+    end
+
+    def disable
+        another = self.clone
+        another.enable = false
+        another
+    end
+
+    def enable=(value)
+        @enable = value
+    end
+
+    def report(&block)
+        @report = block
+    end
+
+    def status
+        @status
+    end
+
+    def status=(code)
+        if code >= @status
+            @status = code
+        end
+    end
+
+    def messages
+        @messages.map { |m| m[1] }
+    end
+
+    def messages=(message)
+        @messages << [EXIT_SUCCESS, message.chomp]
+    end
+
+    def ok(*messages)
+        add_status(EXIT_SUCCESS, messages)
+    end
+
+    def add_status(code, messages)
+        self.status = code
+        unless messages.empty? or messages[0].nil?
+            @messages = @messages + messages.map { |t| [code, t] }
+        end
+    end
+
+    def warning(*messages)
+        add_status(EXIT_WARNING, messages)
+    end
+
+    def critical(*messages)
+        add_status(EXIT_CRITICAL, messages)
+    end
+
+    def unknown(*messages)
+        add_status(EXIT_UNKNOWN, messages)
+    end
+
+    def add_perfdata(label, value,
+            unit=nil, warn=nil, crit=nil, min=nil, max=nil)
+        @perfdata << {
+            :label => label,
+            :value => value,
+            :unit => unit,
+            :warn => warn,
+            :crit => crit,
+            :min => min,
+            :max => max }
+    end
+
+    def fmt_perfdata_item(perfdata)
+        str = perfdata[:label] + "=" + perfdata[:value].to_s
+        str << perfdata[:unit] unless perfdata[:unit].nil?
+        [:warn, :crit, :min, :max].each do |item|
+            break if perfdata[item].nil?
+            str << ';' + perfdata[item]
+        end
+        str
+    end
+
+    def fmt_perfdata
+        @perfdata.map { |perfdata| fmt_perfdata_item(perfdata) }.join(', ')
+    end
+
+    def dbg(msg)
+        if self.debug
+            puts "DBG(#{self.class}): " + msg
+        end
+    end
+
+    def fmt_output
+        out = @servicename
+        out += ' ' + @runid if @runid
+        out +=  ' ' + STATUS_STR[@status]
+        if @summary
+            out << " - [#{self.status_category}] #{@summary}"
+        end
+        if @fqdn
+            out << " on #{@fqdn}"
+        end
+        unless @perfdata.empty?
+            out << '|' + fmt_perfdata
+        end
+        if @verbose
+            out << "\n" + self.messages.join("\n")
+        end
+        out
+    end
+
+    def die(msg)
+        self.summary = msg
+        self.critical(msg)
+        self.exit
+    end
+
+    def to_s
+        fmt_output
+    end
+
+    # This method is the only one that "does" anything, and it
+    # does everything
+    def exit
+        if @enable
+            if @report.respond_to? :call
+                begin
+                    @report.call(self.disable)
+                rescue StandardError => e
+                    self.summary += " (encountered exception in report: #{e.to_s})"
+                end
+            end
+            puts fmt_output
+            Process.exit(@status)
+        end
+    end
+end
+
+class InvUpdateNagiosPlugin < NagiosPlugin
+    attr_accessor :inventory, :output_limit
+
+    def exit
+        self.update_inventory
+        super
+    end
+
+    def output
+        draft_output = self.messages.join("\n") + "\n"
+        if draft_output.length > @output_limit
+           mess = @messages.select { |m| m[0] > EXIT_SUCCESS }.map { |m| m[1] }
+           other_count = @messages.select { |m| m[0] <= EXIT_SUCCESS }.length
+           mess.join("\n") + "... #{other_count} non-errors\n"
+        else
+           draft_output
+        end
+    end
+
+    def update_inventory
+        begin
+            if self.inventory
+                if self.fqdn.nil?
+                    self.warning("inventory defined for update but no fqdn given (errors?)")
+                else
+
+                    system = {
+                        'fqdn' => self.fqdn,
+                        'config_agent_timestamp' => self.runid,
+                        'config_agent_status' => self.status_category,
+                        'config_agent_summary' => self.summary,
+                        'config_agent_output' => self.output,
+                    }
+                    self.dbg system.to_json
+                    self.inventory.tc_post(system)
+                end
+            end
+        rescue StandardError => e
+            self.summary += " {error updating inventory: #{e.to_s}}"
+        end
+    end
+end
+
+require 'yaml'
+
+class PulseUpdateNagiosPlugin < InvUpdateNagiosPlugin
+    attr_accessor :puppet_exit, :pulse_host, :pulse_tags
+
+    def initialize(servicename)
+       super
+
+       self.pulse_host = ''
+       self.puppet_exit = "unknown"
+
+       begin
+          config = YAML::load(File.open('/etc/puppet/pulse-info.yaml'))
+          
+          self.pulse_host = config['pulse_host']
+          self.pulse_tags = ''
+          
+          if config.key?('tags')
+             config['tags'].each do |tag, value|
+                 self.pulse_tags += " #{tag}=#{value}"
+             end
+          end
+          
+       rescue StandardError => e
+          self.pulse_host = ''
+          puts "Error loading pulse configuration (Pulse reporting disabled): #{e.to_s}"
+       end
+    end
+
+    def exit            
+        self.send_to_pulse
+        super   
+    end
+
+    def get_perfdata(name)
+        entry = self.perfdata.find { |l| l[:label] == name }
+        return entry.nil? ? "unknown" : entry[:value].to_s
+    end
+
+    def send_to_pulse
+        if not (self.pulse_host.nil? or (self.pulse_host =~ /\S/).nil?) then
+            elapsed = self.get_perfdata("elapsed")
+            changes = self.get_perfdata("changes")
+            errors = self.get_perfdata("errors")
+            catalog_retrieval = self.get_perfdata("catalog_retrieval")
+            catalog_run = self.get_perfdata("catalog_run")
+            status = self.status_category
+            puppet_exit = self.puppet_exit
+
+            now = (Time.now.to_f * 1000.0).to_i
+            hostname=self.fqdn
+            basetags = "host=#{hostname} #{self.pulse_tags.strip}"
+
+            begin 
+                socket = TCPSocket.open(self.pulse_host, 4242)  # Connect to server
+                socket.print("put puppet.runtime.total #{now} #{elapsed} status=#{status} puppet_exit=#{puppet_exit} #{basetags}\n")
+                socket.print("put puppet.runtime.catalog_retrieval #{now} #{catalog_retrieval} status=#{status} puppet_exit=#{puppet_exit} #{basetags}\n")
+                socket.print("put puppet.runtime.catalog_run #{now} #{catalog_run} status=#{status} puppet_exit=#{puppet_exit} #{basetags}\n")
+                socket.print("put puppet.changes #{now} #{changes} status=#{status} puppet_exit=#{puppet_exit} #{basetags}\n")
+                socket.print("put puppet.errors #{now} #{errors} status=#{status} puppet_exit=#{puppet_exit} #{basetags}\n")
+                socket.print("put puppet.count #{now} 1 status=#{status} puppet_exit=#{puppet_exit} #{basetags}\n")
+                socket.flush
+                socket.close
+            rescue StandardError => e
+                self.summary += "{Error reporting to Kairos : #{e.to_s}}"
+            end 
+        else
+            self.summary += " {Pulse reporting off}"        
+        end
+    end
+end
+
+require 'etc'
+require 'fileutils'
+
+class Homedirs
+
+    attr_accessor :unowned
+
+    def unowned?(dir)
+        begin
+            owner = File.stat(dir).uid
+            uid = Etc.getpwuid owner
+            false
+        rescue ArgumentError => e
+            true
+        end
+    end
+
+    def remove_unowned
+        unowned.each do |homedir|
+            FileUtils.remove_dir homedir
+        end
+        unowned = [ ]
+    end
+
+    def initialize(homeroot="/home")
+        @unowned = [ ]
+        Dir.open(homeroot) do |dh|
+            dh.each do |homedir|
+                next if /^\./.match homedir
+                fullname = File.join(homeroot, homedir)
+                @unowned << fullname if unowned? fullname
+            end
+        end
+    end
+
+end
+
+class Hash
+    # Not real json--doesn't allow nesting
+    # or types other than strings,
+    # but implemented here to do away with
+    # a prerequisite
+
+    def json_escape(s)
+        s.
+            gsub("\r", '\r').
+            gsub("\n", '\n').
+            gsub("\t", '\t').
+            gsub("\f", '\f').
+            gsub("\\", '\\').
+            gsub("\"", '\"').
+            gsub("\b", '\b')
+    end
+
+    def to_json
+        "{ " +
+        self.map do |k, v|
+            '"' + json_escape(k.to_s) + '": "' +
+                json_escape(v.to_s) + '"'
+        end.join(", ") + " }"
+    end
+end
+
+class String
+    def stripcolor
+        self.gsub(/\e\[[0-9\;]+?m/, '').gsub(/<span[^>]*>(.*?)<\/span>/) do |m|
+            m[1]
+        end
+    end
+end
+
+class Time
+    def ts
+        self.gmtime.strftime('%Y-%m-%d %H:%M:%S')
+    end
+end
+
+def extract_passthru_opts(optspec, opt)
+    optnamelist = optspec.map { |el| el.sub(/[^a-zA-Z0-9\-\_].*/, '') }
+    popt = { }
+    (opt.keys & optnamelist).each do |optname|
+        popt[optname] = opt[optname]
+        opt.delete optname
+    end
+    [opt, popt]
+end
+
+
+# Copy of puppet options to pass through
+# Probably should be much more extensive
+puppet_options = [
+    'color=s',
+    'enable!',
+    'trace!',
+    'fqdn=s',
+    'logdest=s',
+    'certname=s',
+    'ca_server=s',
+    'environment=s',
+    'server=s',
+    'report=s'
+]
+
+$opt, $puppet_opt = extract_passthru_opts(puppet_options,
+                                  Longopt.new([
+                                                  'verbose!',
+                                                  'error=s@',
+                                                  'warning=s@',
+                                                  'output=s@',
+                                                  'lockfile=s',
+                                                  'progress!',
+                                                  'agent!',
+                                                  'noop!',
+                                                  'output-limit=i',
+                                                  'update-inventory!',
+                                                  'debug!',
+                                                  'trafficcontrol=s%',
+                                                  'tags=s',
+                                                  'standalone!'
+                                              ] + puppet_options))
+
+unless $opt.has_key? 'update-inventory'
+    $opt['update-inventory'] = true
+end
+
+if ! $opt.has_key? 'progress'
+    if $stdout.tty?
+        $opt['progress'] = true
+    end
+end
+
+$opt['verbose'] ||= false
+$opt['noop'] ||= false
+$opt['lockfile'] ||= '/etc/lock-puppet'
+$opt['puppet-type'] = :auto
+$opt['puppet-type'] = :agent if $opt['agent']
+$opt['puppet-type'] = :standalone if $opt['standalone']
+$opt['output-limit'] ||= 65000
+
+$opt['trafficcontrol']              ||= { }
+$opt['trafficcontrol']['url']       ||= 'http://cmdb/api/v1/fact'
+$opt['trafficcontrol']['username']  ||= 'testuser'
+$opt['trafficcontrol']['password']  ||= 'nonsense'
+
+tags = []
+tags << $opt['tags'].split(',') if $opt['tags']
+tags << ARGV if ARGV.size > 0
+
+$puppet_opt['tags'] = tags.join(',')
+
+$puppet_opt['debug'] = true if $opt['debug']
+
+$puppet_opt['noop'] = true if $opt['noop']
+
+$plugin = PulseUpdateNagiosPlugin.new('runpuppet')
+$plugin.debug = $opt['debug']
+$plugin.verbose = $opt['verbose']
+$plugin.output_limit = $opt['output-limit']
+
+if $opt['update-inventory']
+    $plugin.inventory =
+        PPInventory.new(
+                    { 'trafficcontrol' => $opt['trafficcontrol'],
+                            'debug' => ($opt['debug'] ? 2 : 0) })
+end
+
+def dbg(msg)
+    if $opt['debug']
+        puts "DBG(runpuppet): " + msg
+    end
+end
+
+
+def head(file)
+    begin
+        File.open(file, 'r') { |fh| fh.readline }.chomp
+    rescue EOFError
+        nil
+    end
+end
+
+def locked?(now=nil)
+    now ||= Time.now
+    if File.exist? $opt['lockfile']
+        expiry = head $opt['lockfile']
+        if /^\d+$/.match(expiry)
+            expiry = Time.at(expiry.to_i)
+            dbg "locked until #{expiry.ts} (it's #{now.ts})"
+            if expiry >= now
+                expiry.ts
+            else
+                false
+            end
+        else
+            'forever'
+        end
+    else
+        false
+    end
+end
+
+def get_fqdn
+    begin
+        require 'facter'
+        begin
+            require 'puppet'
+            Puppet.parse_config
+            unless $LOAD_PATH.include?(Puppet[:libdir])
+                $LOAD_PATH << Puppet[:libdir]
+            end
+        rescue StandardError => e
+            $plugin.warning("Received errors trying to load puppet",
+                    e.message, *e.backtrace)
+        end
+        Facter.fqdn
+    rescue StandardError => e
+        $plugin.warning("Received errors calculating fqdn with facter",
+                e.message, *e.backtrace)
+        nil
+    end
+end
+
+$plugin.fqdn = $opt['fqdn'] || get_fqdn
+
+dbg "fqdn: #{$plugin.fqdn.inspect}"
+
+def invoke(cmd)
+    $stdout.flush
+    IO.popen('-', 'r') do |io|
+        if io.nil?
+            # I am the child
+            # Redirect stderr
+            $stdin.close
+            $stderr.reopen($stdout)
+            exec *cmd
+            puts "err: Couldn't execute cmd - #{$!}"
+            Process.exit(8)
+        else
+            io.each do |line|
+                yield line
+            end
+        end
+    end
+    $?.exitstatus
+end
+
+# TODO detect standalone puppet by cron job?
+def puppet_type
+    return :agent
+end
+
+def puppet_cmd(opt, type=:auto)
+    case type
+    when :auto
+        puppet_cmd(opt, puppet_type)
+    when :standalone
+        [($opt['puppet'] || '/etc/puppet/tools/standalone-puppet'),
+            '--verbose']
+    when :agent
+        # Add puppet options to invoke agent
+        ['verbose', 'detailed-exitcodes', 'onetime', 'no-daemonize',
+            'ignorecache', 'no-usecacheonfailure'].each do |optname|
+            $puppet_opt[optname] = true
+        end
+        [($opt['puppet'] || 'puppet'),
+            'agent' ] + $puppet_opt.keys.map { |optname|
+            "--#{optname}" +
+            ($puppet_opt[optname] == true ? '' : "=#{$puppet_opt[optname]}")
+            }
+    else
+        $plugin.die("Can't determine puppet type (agent or standalone)")
+    end
+end
+
+def vrb(msg)
+    puts msg if $opt['verbose']
+end
+
+cmd = puppet_cmd($puppet_opt, $opt['puppet-type'])
+dbg "Running: " + cmd.join(' ')
+
+log = []
+buf = []
+version = nil
+catalog = false
+applied = false
+runts = Time.now
+$plugin.runid = runts.ts
+errct = 0
+changect = 0
+
+if locked? runts
+    $plugin.summary = "locked until #{locked?}"
+    $plugin.status_category = 'locked'
+    $plugin.ok
+    $plugin.exit
+end
+
+$plugin.status_category = 'running'
+begin
+    unless $opt['noop']
+        vrb "Removing unowned home directories"
+        Homedirs.new.remove_unowned
+    end
+    invoke(cmd) do |line|
+        puts line if $opt['progress']
+        logs = [ ]
+        ts = Time.now
+        flatline = line.stripcolor.chomp
+        dbg "output line: ``#{flatline}''"
+        if m = /^(err|info|notice|warning|debug): *(.*)/.match(flatline)
+            level = m[1]
+            text = m[2]
+            ts = Time.now
+            addlines = [ ]
+            unless buf.empty?
+                addlines = buf
+                buf = [ ]
+            end
+            if m = /already in progress; skipping/.match(text)
+                $plugin.inventory = nil
+                $plugin.status_category = 'skip'
+                $plugin.unknown(flatline)
+            end
+            if m = /Applying configuration version \'([^\']+)\'/.match(text)
+                catalog = true
+                version = m[1]
+                catalog_retrieval = ts - runts
+                $plugin.add_perfdata('catalog_retrieval',
+                            catalog_retrieval, 's')
+            end
+            if m = /Finished catalog run in ([\d\.]+) seconds/.match(text)
+                applied = true
+                $plugin.add_perfdata('catalog_run', m[1], 's')
+            end
+            log << {
+                :level => level,
+                :text => text,
+                :timestamp => ts,
+                :addlines => addlines,
+                :output => line.chomp
+            }
+            case level
+            when 'err'
+                errct += 1
+                $plugin.warning(flatline)
+                case text
+                when /Could not retrieve catalog from remote server/
+                    $plugin.critical
+                    if /Error 400 on SERVER/.match(text)
+                        $plugin.status_category = 'catalog-error'
+                    else
+                        $plugin.status_category = 'connect-error'
+                    end
+                end
+            when 'notice'
+                if m = /(\/\S+):/.match(text)
+                    resource = m[1]
+                    changect += 1
+                    $plugin.ok(flatline)
+                end
+            end
+        else
+            buf << flatline
+        end
+    end
+    puppet_exit = $?.exitstatus
+    case puppet_exit
+    when 0
+        $plugin.ok
+        $plugin.status_category = 'ok'
+        $plugin.summary = "no changes"
+        $plugin.add_perfdata('changes_applied', 0)
+    when 1
+        $plugin.critical
+        $plugin.status_category = 'crash' if $plugin.status_category == 'running'
+        $plugin.summary = "error"
+    when 2
+        $plugin.ok
+        $plugin.status_category = 'ok'
+        $plugin.summary = "#{changect} changes"
+        $plugin.add_perfdata('changes_applied', changect)
+    when 4
+        $plugin.warning
+        $plugin.status_category = 'errors'
+        $plugin.summary = "no changes, but had failures"
+        $plugin.add_perfdata('changes_applied', 0)
+    when 6
+        $plugin.warning
+        $plugin.status_category = 'errors'
+        $plugin.summary = "#{changect} changes, had failures"
+        $plugin.add_perfdata('changes_applied', changect)
+    else
+        $plugin.status_category = 'crash'
+        $plugin.critical
+        $plugin.summary = "failed to run puppet, exited with #{puppet_exit}"
+        # do something with buf, it probably has stderr
+    end
+    finishts = Time.now
+    $plugin.summary += " catalog" if catalog
+    $plugin.summary += " applied" if applied
+    $plugin.summary += " version " + version if version
+    $plugin.summary += " exit #{puppet_exit.to_s}" unless puppet_exit == 0
+    $plugin.add_perfdata('changes', changect)
+    $plugin.add_perfdata('elapsed', finishts - runts, 's')
+    $plugin.add_perfdata('errors', errct)
+rescue StandardError => e
+    $plugin.critical(e.message, *e.backtrace)
+    $plugin.die("Error running puppet: #{e.to_s}")
+end
+
+if errct > 0
+    $plugin.summary += " (#{errct} errors)"
+end
+
+$plugin.exit
